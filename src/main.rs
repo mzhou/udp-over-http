@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use std::io::Error as IoError;
 use std::net::{AddrParseError, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use clap::Parser;
@@ -21,6 +22,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::{
     channel as broadcast_channel, Receiver as BroadcastReceiver, Sender as BroadcastSender,
 };
+use tokio::time::sleep;
 use tokio::{select, spawn};
 
 use crate::danger::NoCertificateVerification;
@@ -168,6 +170,7 @@ fn make_https_client() -> HttpsClient {
 async fn requester(context: AppContext, url: String) {
     loop {
         request_once(context.clone(), url.clone()).await;
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
