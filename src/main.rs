@@ -1,3 +1,5 @@
+mod danger;
+
 use std::convert::Infallible;
 use std::io::Error as IoError;
 use std::net::{AddrParseError, SocketAddr};
@@ -5,10 +7,14 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use clap::Parser;
-use hyper::body::{Bytes, Sender as BodySender};
+use hyper::body::{Bytes, HttpBody, Sender as BodySender};
+use hyper::client::{Client, HttpConnector};
+use hyper::http::Method;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Error as HyperError, Request, Response, Server};
+use hyper::{Body, Error as HyperError, Request, Response, Server, StatusCode};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use rustls::{ClientConfig, ALL_CIPHER_SUITES, ALL_KX_GROUPS, ALL_VERSIONS};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast::error::RecvError;
@@ -16,6 +22,8 @@ use tokio::sync::broadcast::{
     channel as broadcast_channel, Receiver as BroadcastReceiver, Sender as BroadcastSender,
 };
 use tokio::{select, spawn};
+
+use crate::danger::NoCertificateVerification;
 
 #[derive(Clone)]
 struct AppContext {
@@ -35,7 +43,11 @@ struct Args {
     udp_bind: String,
     #[arg(long)]
     udp_connect: String,
+    #[arg(long)]
+    url: String,
 }
+
+type HttpsClient = Client<HttpsConnector<HttpConnector>>;
 
 #[derive(Debug, Error)]
 enum MainError {
@@ -71,8 +83,8 @@ async fn forward(mut receiver: BroadcastReceiver<Bytes>, mut sender: BodySender)
 
 async fn handle(
     context: AppContext,
-    addr: SocketAddr,
-    req: Request<Body>,
+    _addr: SocketAddr,
+    _req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
     let (sender, body) = Body::channel();
     let _ = spawn(forward(context.broadcast_sender.subscribe(), sender));
@@ -103,6 +115,8 @@ async fn main() -> Result<(), MainError> {
 
     let udp_reader_task = spawn(udp_reader(context.clone()));
 
+    let request_task = spawn(requester(context.clone(), args.url));
+
     let make_service = make_service_fn(move |conn: &AddrStream| {
         let context = context.clone();
         let addr = conn.remote_addr();
@@ -118,6 +132,8 @@ async fn main() -> Result<(), MainError> {
     let server_task = spawn(server);
 
     select! {
+        _ = request_task => {
+        },
         _ = server_task => {
         },
         _ = udp_reader_task => {
@@ -127,11 +143,84 @@ async fn main() -> Result<(), MainError> {
     Ok(())
 }
 
+fn make_https_client() -> HttpsClient {
+    let mut http_connector = HttpConnector::new();
+    http_connector.enforce_http(false);
+    http_connector.set_nodelay(true);
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(
+            ClientConfig::builder()
+                .with_cipher_suites(&ALL_CIPHER_SUITES)
+                .with_kx_groups(&ALL_KX_GROUPS)
+                .with_protocol_versions(ALL_VERSIONS)
+                .unwrap()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
+                .with_no_client_auth(),
+        )
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    let client = Client::builder().build::<_, Body>(https);
+    client
+}
+
+async fn requester(context: AppContext, url: String) {
+    loop {
+        request_once(context.clone(), url.clone()).await;
+    }
+}
+
+async fn request_once(context: AppContext, url: String) {
+    let udp_socket = &context.shared.udp_socket;
+    let client = make_https_client();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(url)
+        .body(Body::empty())
+        .unwrap();
+    let res = match client.request(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("request_once request {:?}", e);
+            return;
+        }
+    };
+    if res.status() != StatusCode::OK {
+        eprintln!("request_once status {}", res.status());
+        return;
+    }
+    let mut buf = BytesMut::with_capacity(1024 * 1024);
+    let mut body = res.into_body();
+    while let Some(Ok(chunk)) = body.data().await {
+        buf.extend_from_slice(chunk.as_ref());
+        // keep trying to pop packets off
+        loop {
+            if buf.len() < 2 {
+                // need more data
+                break;
+            }
+            let size = (buf[0] as usize) | ((buf[1] as usize) << 8);
+            if buf.len() < 2 + size {
+                // need more data
+                break;
+            }
+            let packet_with_size = buf.split_to(2 + size);
+            let packet = &packet_with_size[2..];
+            let send_result = udp_socket.send(packet).await;
+            if let Err(e) = send_result {
+                eprintln!("request_once send {:?}", e);
+            }
+        }
+    }
+    eprintln!("request_once done");
+}
+
 async fn udp_reader(context: AppContext) {
     let broadcast_sender = context.broadcast_sender;
     let udp_socket = &context.shared.udp_socket;
     loop {
-        let mut buf = BytesMut::zeroed(2 + 65536);
+        let mut buf = BytesMut::zeroed(2 + 64 * 1024);
         let recv_result = udp_socket.recv(&mut buf[2..]).await;
         match recv_result {
             Ok(size) => {
