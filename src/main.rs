@@ -3,16 +3,23 @@ use std::io::Error as IoError;
 use std::net::{AddrParseError, SocketAddr};
 use std::sync::Arc;
 
+use bytes::BytesMut;
 use clap::Parser;
+use hyper::body::{Bytes, Sender as BodySender};
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Error as HyperError, Request, Response, Server};
 use thiserror::Error;
 use tokio::net::UdpSocket;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{
+    channel as broadcast_channel, Receiver as BroadcastReceiver, Sender as BroadcastSender,
+};
 use tokio::{select, spawn};
 
 #[derive(Clone)]
 struct AppContext {
+    broadcast_sender: BroadcastSender<Bytes>,
     shared: Arc<AppContextShared>,
 }
 
@@ -40,12 +47,36 @@ enum MainError {
     Io(#[from] IoError),
 }
 
+async fn forward(mut receiver: BroadcastReceiver<Bytes>, mut sender: BodySender) {
+    loop {
+        let recv_result = receiver.recv().await;
+        match recv_result {
+            Ok(data) => {
+                let send_result = sender.send_data(data).await;
+                if let Err(e) = send_result {
+                    eprintln!("forward send {:?}", e);
+                    break;
+                }
+            }
+            Err(RecvError::Lagged(skipped)) => {
+                eprintln!("forward recv skipped {}", skipped);
+            }
+            Err(RecvError::Closed) => {
+                eprintln!("forward recv closed");
+                break;
+            }
+        }
+    }
+}
+
 async fn handle(
     context: AppContext,
     addr: SocketAddr,
     req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
-    Ok(Response::new(Body::from("Hello World")))
+    let (sender, body) = Body::channel();
+    let _ = spawn(forward(context.broadcast_sender.subscribe(), sender));
+    Ok(Response::new(body))
 }
 
 #[tokio::main]
@@ -63,7 +94,10 @@ async fn main() -> Result<(), MainError> {
     udp_socket.connect(udp_connect).await?;
     eprintln!("UDP connected to {:?}", udp_connect);
 
+    let (broadcast_sender, _broadcast_receiver) = broadcast_channel(1024);
+
     let context = AppContext {
+        broadcast_sender,
         shared: Arc::new(AppContextShared { udp_socket }),
     };
 
@@ -94,14 +128,18 @@ async fn main() -> Result<(), MainError> {
 }
 
 async fn udp_reader(context: AppContext) {
-    let mut buf = [0u8; 2 + 65536];
+    let broadcast_sender = context.broadcast_sender;
     let udp_socket = &context.shared.udp_socket;
     loop {
-        eprintln!("recv about to be called");
+        let mut buf = BytesMut::zeroed(2 + 65536);
         let recv_result = udp_socket.recv(&mut buf[2..]).await;
         match recv_result {
             Ok(size) => {
-                eprintln!("recv {} bytes", size);
+                let size_u16: u16 = size.try_into().unwrap();
+                buf[0] = (size_u16 & 0xff) as u8;
+                buf[1] = (size_u16 >> 8) as u8;
+                buf.truncate(2 + size);
+                let _ = broadcast_sender.send(buf.into());
             }
             Err(e) => {
                 eprintln!("recv err {:?}", e);
