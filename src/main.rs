@@ -91,23 +91,26 @@ async fn handle(
 ) -> Result<Response<Body>, Infallible> {
     match *req.method() {
         Method::POST => {
+            eprintln!("handle POST");
             let mut body = req.into_body();
             let mut buf = [0u8; 2 + 64 * 1024];
             let mut buf_used = 0usize;
             let udp_socket = &context.shared.udp_socket;
             loop {
                 let Some(Ok(chunk)) = body.data().await else {
-                    return Ok(Response::new(Body::empty()));
+                    eprintln!("handle POST no more chunks");
+                    break;
                 };
                 if buf_used == 0 {
                     // fast path
                     if chunk.len() < 2 {
                         eprintln!("POST chunk shorter than 2 not implementeD");
-                        return Ok(Response::new(Body::empty()));
+                        break;
                     }
                     let size = (chunk[0] as usize) | ((chunk[1] as usize) << 8);
                     if size != chunk.len() - 2 {
                         eprintln!("POST chunk non-exact not implementeD");
+                        break;
                     }
                     let packet = &chunk[2..];
                     let send_result = udp_socket.send(packet).await;
@@ -116,9 +119,10 @@ async fn handle(
                     }
                 } else {
                     eprintln!("POST chunk while buffer not empty not implemented");
-                    return Ok(Response::new(Body::empty()));
+                    break;
                 }
             }
+            Ok(Response::new(Body::empty()))
         }
         _ => {
             let (sender, body) = Body::channel();
