@@ -95,39 +95,61 @@ async fn handle(
         Method::POST => {
             eprintln!("handle POST");
             let mut body = req.into_body();
-            let mut buf = [0u8; 2 + 64 * 1024];
-            let mut buf_used = 0usize;
+            let mut buf = BytesMut::new();
             let udp_socket = &context.shared.udp_socket;
-            'chunk: loop {
+            loop {
                 let Some(Ok(mut chunk)) = body.data().await else {
                     eprintln!("handle POST no more chunks");
                     break;
                 };
                 while !chunk.is_empty() {
-                    if buf_used == 0 {
+                    if buf.is_empty() {
                         // fast path
                         if chunk.len() < 2 {
-                            eprintln!("POST chunk shorter than 2 not implemented");
-                            break 'chunk;
+                            // length not yet known
+                            let part = chunk.split_to(chunk.len());
+                            buf.extend_from_slice(&part[..]);
+                            break;
                         }
                         let size = (chunk[0] as usize) | ((chunk[1] as usize) << 8);
                         if chunk.len() - 2 < size {
-                            eprintln!(
-                                "POST chunk non-exact not implemented chunk len {} header {}",
-                                chunk.len(),
-                                size
-                            );
-                            break 'chunk;
+                            // partial packet
+                            let part = chunk.split_to(chunk.len());
+                            buf.extend_from_slice(&part[..]);
+                            break;
                         }
                         let part = chunk.split_to(2 + size);
                         let packet = &part[2..];
                         let send_result = udp_socket.send(packet).await;
                         if let Err(e) = send_result {
+                            // non-fatal
                             eprintln!("handle send {:?}", e);
                         }
                     } else {
-                        eprintln!("POST chunk while buffer not empty not implemented");
-                        break 'chunk;
+                        // here buf is exactly 1 byte
+                        if buf.len() < 2 {
+                            // take one byte off chunk so we know the packet size
+                            let chunk_part = chunk.split_to(1);
+                            buf.extend_from_slice(&chunk_part[..]);
+                        }
+                        // here we're guaranteed buf is at least 2 bytes
+                        let size = (buf[0] as usize) | ((buf[1] as usize) << 8);
+                        let needed = 2 + size - buf.len();
+                        if chunk.len() >= needed {
+                            let chunk_part = chunk.split_to(needed);
+                            buf.extend_from_slice(&chunk_part[..]);
+                            let part = buf.split_to(2 + size);
+                            let packet = &part[2..];
+                            let send_result = udp_socket.send(packet).await;
+                            if let Err(e) = send_result {
+                                // non-fatal
+                                eprintln!("handle send {:?}", e);
+                            }
+                        } else {
+                            // need to keep waiting
+                            let chunk_part = chunk.split_to(chunk.len());
+                            buf.extend_from_slice(&chunk_part[..]);
+                        }
                     }
                 }
             }
