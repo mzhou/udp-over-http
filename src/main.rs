@@ -42,6 +42,8 @@ struct AppContextShared {
 struct Args {
     #[arg(long, default_value = "")]
     http_listen: String,
+    #[arg(long, default_value = "")]
+    push_url: String,
     #[arg(long, default_value = "[::]:0")]
     udp_bind: String,
     #[arg(long)]
@@ -87,7 +89,7 @@ async fn forward(mut receiver: BroadcastReceiver<Bytes>, mut sender: BodySender)
 async fn handle(
     context: AppContext,
     _addr: SocketAddr,
-    mut req: Request<Body>,
+    req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
     match *req.method() {
         Method::POST => {
@@ -158,6 +160,11 @@ async fn main() -> Result<(), MainError> {
     let udp_reader_task = spawn(udp_reader(context.clone()));
     tasks.push(udp_reader_task);
 
+    if !args.push_url.is_empty() {
+        let push_request_task = spawn(push_requester(context.clone(), args.push_url));
+        tasks.push(push_request_task);
+    }
+
     if !args.url.is_empty() {
         let request_task = spawn(requester(context.clone(), args.url));
         tasks.push(request_task);
@@ -209,6 +216,25 @@ fn make_https_client() -> HttpsClient {
         .build();
     let client = Client::builder().build::<_, Body>(https);
     client
+}
+
+async fn push_requester(context: AppContext, url: String) {
+    loop {
+        push_request_once(context.clone(), url.clone()).await;
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn push_request_once(context: AppContext, url: String) {
+    let client = make_https_client();
+    let (sender, body) = Body::channel();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(url)
+        .body(body)
+        .unwrap();
+    let _ = spawn(forward(context.broadcast_sender.subscribe(), sender));
+    let _res = client.request(req).await;
 }
 
 async fn requester(context: AppContext, url: String) {
