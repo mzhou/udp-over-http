@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use clap::Parser;
+use futures::stream::{FuturesUnordered, StreamExt};
 use hyper::body::{Bytes, HttpBody, Sender as BodySender};
 use hyper::client::{Client, HttpConnector};
 use hyper::http::Method;
@@ -18,12 +19,12 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use rustls::{ClientConfig, ALL_CIPHER_SUITES, ALL_KX_GROUPS, ALL_VERSIONS};
 use thiserror::Error;
 use tokio::net::UdpSocket;
+use tokio::spawn;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::{
     channel as broadcast_channel, Receiver as BroadcastReceiver, Sender as BroadcastSender,
 };
 use tokio::time::sleep;
-use tokio::{select, spawn};
 
 use crate::danger::NoCertificateVerification;
 
@@ -45,7 +46,7 @@ struct Args {
     udp_bind: String,
     #[arg(long)]
     udp_connect: String,
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     url: String,
 }
 
@@ -149,9 +150,15 @@ async fn main() -> Result<(), MainError> {
         shared: Arc::new(AppContextShared { udp_socket }),
     };
 
-    let udp_reader_task = spawn(udp_reader(context.clone()));
+    let mut tasks = FuturesUnordered::new();
 
-    let request_task = spawn(requester(context.clone(), args.url));
+    let udp_reader_task = spawn(udp_reader(context.clone()));
+    tasks.push(udp_reader_task);
+
+    if !args.url.is_empty() {
+        let request_task = spawn(requester(context.clone(), args.url));
+        tasks.push(request_task);
+    }
 
     let make_service = make_service_fn(move |conn: &AddrStream| {
         let context = context.clone();
@@ -165,16 +172,12 @@ async fn main() -> Result<(), MainError> {
 
     eprintln!("HTTP listening on {:?}", server.local_addr());
 
-    let server_task = spawn(server);
+    let server_task = spawn(async {
+        let _ = server.await;
+    });
+    tasks.push(server_task);
 
-    select! {
-        _ = request_task => {
-        },
-        _ = server_task => {
-        },
-        _ = udp_reader_task => {
-        },
-    };
+    tasks.next().await;
 
     Ok(())
 }
