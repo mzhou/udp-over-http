@@ -86,11 +86,45 @@ async fn forward(mut receiver: BroadcastReceiver<Bytes>, mut sender: BodySender)
 async fn handle(
     context: AppContext,
     _addr: SocketAddr,
-    _req: Request<Body>,
+    mut req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
-    let (sender, body) = Body::channel();
-    let _ = spawn(forward(context.broadcast_sender.subscribe(), sender));
-    Ok(Response::new(body))
+    match *req.method() {
+        Method::POST => {
+            let mut body = req.into_body();
+            let mut buf = [0u8; 2 + 64 * 1024];
+            let mut buf_used = 0usize;
+            let udp_socket = &context.shared.udp_socket;
+            loop {
+                let Some(Ok(chunk)) = body.data().await else {
+                    return Ok(Response::new(Body::empty()));
+                };
+                if buf_used == 0 {
+                    // fast path
+                    if chunk.len() < 2 {
+                        eprintln!("POST chunk shorter than 2 not implementeD");
+                        return Ok(Response::new(Body::empty()));
+                    }
+                    let size = (chunk[0] as usize) | ((chunk[1] as usize) << 8);
+                    if size != chunk.len() - 2 {
+                        eprintln!("POST chunk non-exact not implementeD");
+                    }
+                    let packet = &chunk[2..];
+                    let send_result = udp_socket.send(packet).await;
+                    if let Err(e) = send_result {
+                        eprintln!("handle send {:?}", e);
+                    }
+                } else {
+                    eprintln!("POST chunk while buffer not empty not implemented");
+                    return Ok(Response::new(Body::empty()));
+                }
+            }
+        }
+        _ => {
+            let (sender, body) = Body::channel();
+            let _ = spawn(forward(context.broadcast_sender.subscribe(), sender));
+            Ok(Response::new(body))
+        }
+    }
 }
 
 #[tokio::main]
