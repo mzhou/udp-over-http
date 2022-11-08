@@ -126,8 +126,9 @@ async fn handle(
                             eprintln!("handle send {:?}", e);
                         }
                     } else {
-                        // here buf is exactly 1 byte
+                        // here buf is at least 1 byte
                         if buf.len() < 2 {
+                            // here buf is exactly 1 byte
                             // take one byte off chunk so we know the packet size
                             let chunk_part = chunk.split_to(1);
                             buf.extend_from_slice(&chunk_part[..]);
