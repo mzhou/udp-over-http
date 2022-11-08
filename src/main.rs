@@ -40,7 +40,7 @@ struct AppContextShared {
 
 #[derive(Debug, Parser)]
 struct Args {
-    #[arg(long, default_value = "[::]:0")]
+    #[arg(long, default_value = "")]
     http_listen: String,
     #[arg(long, default_value = "[::]:0")]
     udp_bind: String,
@@ -132,7 +132,6 @@ async fn handle(
 async fn main() -> Result<(), MainError> {
     let args = Args::parse();
 
-    let http_listen: SocketAddr = args.http_listen.parse()?;
     let udp_bind: SocketAddr = args.udp_bind.parse()?;
     let udp_connect: SocketAddr = args.udp_connect.parse()?;
 
@@ -160,22 +159,26 @@ async fn main() -> Result<(), MainError> {
         tasks.push(request_task);
     }
 
-    let make_service = make_service_fn(move |conn: &AddrStream| {
-        let context = context.clone();
-        let addr = conn.remote_addr();
-        let service = service_fn(move |req| handle(context.clone(), addr, req));
+    if !args.http_listen.is_empty() {
+        let http_listen: SocketAddr = args.http_listen.parse()?;
 
-        async move { Ok::<_, Infallible>(service) }
-    });
+        let make_service = make_service_fn(move |conn: &AddrStream| {
+            let context = context.clone();
+            let addr = conn.remote_addr();
+            let service = service_fn(move |req| handle(context.clone(), addr, req));
 
-    let server = Server::bind(&http_listen).serve(make_service);
+            async move { Ok::<_, Infallible>(service) }
+        });
 
-    eprintln!("HTTP listening on {:?}", server.local_addr());
+        let server = Server::bind(&http_listen).serve(make_service);
 
-    let server_task = spawn(async {
-        let _ = server.await;
-    });
-    tasks.push(server_task);
+        eprintln!("HTTP listening on {:?}", server.local_addr());
+
+        let server_task = spawn(async {
+            let _ = server.await;
+        });
+        tasks.push(server_task);
+    }
 
     tasks.next().await;
 
