@@ -335,7 +335,6 @@ async fn udp_reader(context: AppContext) {
             }
             Err(e) => {
                 eprintln!("recv err {:?}", e);
-                break;
             }
         }
     }
