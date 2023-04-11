@@ -14,3 +14,4 @@ hyper-rustls = { features = ["http2"], version = "0.24" }
 rustls = { features = ["dangerous_configuration"], version = "0.21" }
 thiserror = { version = "1.0" }
 tokio = { features = ["full"], version = "1.27" }
+twox-hash = { version = "1.6" }

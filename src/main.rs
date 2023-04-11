@@ -3,6 +3,7 @@ mod danger;
 use std::convert::Infallible;
 use std::io::Error as IoError;
 use std::net::{AddrParseError, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use hyper::body::{Bytes, HttpBody, Sender as BodySender};
 use hyper::client::{Client, HttpConnector};
+use hyper::header::{AsHeaderName, HeaderMap};
 use hyper::http::Method;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
@@ -25,6 +27,7 @@ use tokio::sync::broadcast::{
     channel as broadcast_channel, Receiver as BroadcastReceiver, Sender as BroadcastSender,
 };
 use tokio::time::sleep;
+use twox_hash::xxh3::hash64;
 
 use crate::danger::NoCertificateVerification;
 
@@ -42,15 +45,27 @@ struct AppContextShared {
 struct Args {
     #[arg(long, default_value = "")]
     http_listen: String,
+    #[arg(long, default_value = "1")]
+    pull_threads: HashValue,
+    #[arg(alias = "url", long, default_value = "")]
+    pull_url: String,
+    #[arg(long, default_value = "1")]
+    push_threads: HashValue,
     #[arg(long, default_value = "")]
     push_url: String,
     #[arg(long, default_value = "[::]:0")]
     udp_bind: String,
     #[arg(long)]
     udp_connect: String,
-    #[arg(long, default_value = "")]
-    url: String,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct ForwardOpts {
+    filter_max: HashValue,
+    filter_min: HashValue,
+}
+
+type HashValue = u64;
 
 type HttpsClient = Client<HttpsConnector<HttpConnector>>;
 
@@ -64,11 +79,24 @@ enum MainError {
     Io(#[from] IoError),
 }
 
-async fn forward(mut receiver: BroadcastReceiver<Bytes>, mut sender: BodySender) {
+const HEADER_NAME_UOH_FILTER_MAX: &str = "uoh-filter-max";
+const HEADER_NAME_UOH_FILTER_MIN: &str = "uoh-filter-min";
+
+async fn forward(
+    opts: ForwardOpts,
+    mut receiver: BroadcastReceiver<Bytes>,
+    mut sender: BodySender,
+) {
     loop {
         let recv_result = receiver.recv().await;
         match recv_result {
             Ok(data) => {
+                if opts.filter_min != 0 || opts.filter_max != !0 {
+                    let hash = hash64(&data);
+                    if !(hash >= opts.filter_min && hash <= opts.filter_max) {
+                        continue;
+                    }
+                }
                 let send_result = sender.send_data(data).await;
                 if let Err(e) = send_result {
                     eprintln!("forward send {:?}", e);
@@ -156,11 +184,16 @@ async fn handle(
             }
             Ok(Response::new(Body::empty()))
         }
-        _ => {
+        Method::GET => {
+            let opts = ForwardOpts {
+                filter_max: parse_header_or(req.headers(), HEADER_NAME_UOH_FILTER_MAX, !0),
+                filter_min: parse_header_or(req.headers(), HEADER_NAME_UOH_FILTER_MIN, 0),
+            };
             let (sender, body) = Body::channel();
-            let _ = spawn(forward(context.broadcast_sender.subscribe(), sender));
+            let _ = spawn(forward(opts, context.broadcast_sender.subscribe(), sender));
             Ok(Response::new(body))
         }
+        _ => Ok(Response::new(Body::empty())),
     }
 }
 
@@ -191,13 +224,30 @@ async fn main() -> Result<(), MainError> {
     tasks.push(udp_reader_task);
 
     if !args.push_url.is_empty() {
-        let push_request_task = spawn(push_requester(context.clone(), args.push_url));
-        tasks.push(push_request_task);
+        let hash_span = !0 / args.push_threads;
+        let rem = !0 % args.push_threads;
+        for i in 0..args.push_threads {
+            let opts = ForwardOpts {
+                filter_max: rem + (i + 1) * hash_span,
+                filter_min: i * hash_span,
+            };
+            let push_request_task =
+                spawn(push_requester(context.clone(), opts, args.push_url.clone()));
+            tasks.push(push_request_task);
+        }
     }
 
-    if !args.url.is_empty() {
-        let request_task = spawn(requester(context.clone(), args.url));
-        tasks.push(request_task);
+    if !args.pull_url.is_empty() {
+        let hash_span = !0 / args.pull_threads;
+        let rem = !0 % args.pull_threads;
+        for i in 0..args.pull_threads {
+            let opts = ForwardOpts {
+                filter_max: rem + (i + 1) * hash_span,
+                filter_min: i * hash_span,
+            };
+            let request_task = spawn(requester(context.clone(), opts, args.pull_url.clone()));
+            tasks.push(request_task);
+        }
     }
 
     if !args.http_listen.is_empty() {
@@ -248,14 +298,26 @@ fn make_https_client() -> HttpsClient {
     client
 }
 
-async fn push_requester(context: AppContext, url: String) {
+fn parse_header_or<K, F>(headers: &HeaderMap, key: K, default: F) -> F
+where
+    K: AsHeaderName,
+    F: FromStr,
+{
+    headers
+        .get(key)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<F>().ok())
+        .unwrap_or(default)
+}
+
+async fn push_requester(context: AppContext, opts: ForwardOpts, url: String) {
     loop {
-        push_request_once(context.clone(), url.clone()).await;
+        push_request_once(context.clone(), opts, url.clone()).await;
         sleep(Duration::from_millis(100)).await;
     }
 }
 
-async fn push_request_once(context: AppContext, url: String) {
+async fn push_request_once(context: AppContext, opts: ForwardOpts, url: String) {
     let client = make_https_client();
     let (sender, body) = Body::channel();
     let req = Request::builder()
@@ -263,21 +325,23 @@ async fn push_request_once(context: AppContext, url: String) {
         .uri(url)
         .body(body)
         .unwrap();
-    let _ = spawn(forward(context.broadcast_sender.subscribe(), sender));
+    let _ = spawn(forward(opts, context.broadcast_sender.subscribe(), sender));
     let _res = client.request(req).await;
 }
 
-async fn requester(context: AppContext, url: String) {
+async fn requester(context: AppContext, opts: ForwardOpts, url: String) {
     loop {
-        request_once(context.clone(), url.clone()).await;
+        request_once(context.clone(), opts, url.clone()).await;
         sleep(Duration::from_millis(100)).await;
     }
 }
 
-async fn request_once(context: AppContext, url: String) {
+async fn request_once(context: AppContext, opts: ForwardOpts, url: String) {
     let udp_socket = &context.shared.udp_socket;
     let client = make_https_client();
     let req = Request::builder()
+        .header(HEADER_NAME_UOH_FILTER_MAX, opts.filter_max.to_string())
+        .header(HEADER_NAME_UOH_FILTER_MIN, opts.filter_min.to_string())
         .method(Method::GET)
         .uri(url)
         .body(Body::empty())
