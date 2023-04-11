@@ -261,7 +261,9 @@ async fn main() -> Result<(), MainError> {
             async move { Ok::<_, Infallible>(service) }
         });
 
-        let server = Server::bind(&http_listen).serve(make_service);
+        let server = Server::bind(&http_listen)
+            .http1_only(true)
+            .serve(make_service);
 
         eprintln!("HTTP listening on {:?}", server.local_addr());
 
@@ -292,7 +294,6 @@ fn make_https_client() -> HttpsClient {
         )
         .https_or_http()
         .enable_http1()
-        .enable_http2()
         .build();
     let client = Client::builder().build::<_, Body>(https);
     client
