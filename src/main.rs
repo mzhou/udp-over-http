@@ -263,6 +263,7 @@ async fn main() -> Result<(), MainError> {
 
         let server = Server::bind(&http_listen)
             .http1_only(true)
+            .tcp_nodelay(true)
             .serve(make_service);
 
         eprintln!("HTTP listening on {:?}", server.local_addr());
