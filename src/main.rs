@@ -225,10 +225,13 @@ async fn main() -> Result<(), MainError> {
 
     if !args.push_url.is_empty() {
         let hash_span = !0 / args.push_threads;
-        let rem = !0 % args.push_threads;
         for i in 0..args.push_threads {
             let opts = ForwardOpts {
-                filter_max: rem + (i + 1) * hash_span,
+                filter_max: if i == args.push_threads - 1 {
+                    !0
+                } else {
+                    (i + 1) * hash_span - 1
+                },
                 filter_min: i * hash_span,
             };
             let push_request_task =
@@ -239,10 +242,13 @@ async fn main() -> Result<(), MainError> {
 
     if !args.pull_url.is_empty() {
         let hash_span = !0 / args.pull_threads;
-        let rem = !0 % args.pull_threads;
         for i in 0..args.pull_threads {
             let opts = ForwardOpts {
-                filter_max: rem + (i + 1) * hash_span,
+                filter_max: if i == args.pull_threads - 1 {
+                    !0
+                } else {
+                    (i + 1) * hash_span - 1
+                },
                 filter_min: i * hash_span,
             };
             let request_task = spawn(requester(context.clone(), opts, args.pull_url.clone()));
